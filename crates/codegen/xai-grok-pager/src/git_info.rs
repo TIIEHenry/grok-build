@@ -373,17 +373,14 @@ pub(crate) fn branch_icon() -> &'static str {
 /// touching ambient env/host state.
 fn decide_branch_icon(nerd_fonts: Option<&str>, host: HostOs, brand: TerminalName) -> &'static str {
     const POWERLINE: &str = "\u{e0a0}";
-    // Windows console fonts lack `⎇`, so use `≡` (also in the legacy CP437 font).
-    let fallback = if host == HostOs::Windows {
-        "\u{2261}" // ≡
-    } else {
-        "\u{2387}" // ⎇
-    };
+    // Use `≡` everywhere: it's widely covered across platform fonts (and in the
+    // legacy CP437 font), unlike `⎇` (U+2387) which is missing from many fonts.
+    const FALLBACK: &str = "\u{2261}"; // ≡
 
     if decide_nerd_fonts(nerd_fonts, host, brand) {
         POWERLINE
     } else {
-        fallback
+        FALLBACK
     }
 }
 
@@ -492,15 +489,13 @@ mod tests {
     }
 
     const POWERLINE: &str = "\u{e0a0}";
-    const ALT_KEY: &str = "\u{2387}"; // ⎇
-    const WIN_FALLBACK: &str = "\u{2261}"; // ≡
+    const FALLBACK: &str = "\u{2261}"; // ≡
 
     #[test]
-    fn windows_default_avoids_powerline_and_alt_key() {
+    fn windows_default_avoids_powerline() {
         let icon = decide_branch_icon(None, HostOs::Windows, TerminalName::Unknown);
-        assert_eq!(icon, WIN_FALLBACK);
+        assert_eq!(icon, FALLBACK);
         assert_ne!(icon, POWERLINE);
-        assert_ne!(icon, ALT_KEY);
     }
 
     #[test]
@@ -514,7 +509,7 @@ mod tests {
         ] {
             assert_eq!(
                 decide_branch_icon(None, HostOs::Windows, brand),
-                WIN_FALLBACK
+                FALLBACK
             );
         }
     }
@@ -534,15 +529,15 @@ mod tests {
     }
 
     #[test]
-    fn nerd_fonts_opt_out_forces_platform_fallback() {
+    fn nerd_fonts_opt_out_forces_fallback() {
         for val in ["0", "false"] {
             assert_eq!(
                 decide_branch_icon(Some(val), HostOs::Windows, TerminalName::Unknown),
-                WIN_FALLBACK
+                FALLBACK
             );
             assert_eq!(
                 decide_branch_icon(Some(val), HostOs::Macos, TerminalName::Unknown),
-                ALT_KEY
+                FALLBACK
             );
         }
     }
@@ -564,10 +559,10 @@ mod tests {
     }
 
     #[test]
-    fn macos_stock_font_terminals_use_alt_key() {
-        // Stock-font macOS terminals tofu the PUA glyph, so both must use `⎇`.
+    fn macos_stock_font_terminals_use_fallback() {
+        // Stock-font macOS terminals tofu the PUA glyph, so both must use `≡`.
         for brand in [TerminalName::AppleTerminal, TerminalName::Iterm2] {
-            assert_eq!(decide_branch_icon(None, HostOs::Macos, brand), ALT_KEY);
+            assert_eq!(decide_branch_icon(None, HostOs::Macos, brand), FALLBACK);
             assert_ne!(decide_branch_icon(None, HostOs::Macos, brand), POWERLINE);
         }
     }

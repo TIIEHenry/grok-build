@@ -724,6 +724,142 @@ mod tests {
         assert!(prompt.contains(crate::prompt::context::DEFAULT_SYSTEM_PROMPT_LABEL));
     }
 
+    // ── action_grounding presence ──────────────────────────────────
+    // The `<action_grounding>` block is the anti-hallucination contract:
+    // the model must not claim it created/modified/ran something unless a
+    // tool call in this session actually did it. If it's missing from the
+    // rendered base prompt, the model is receiving the OLD (un-encrypted
+    // or stale) prompt — a silent "edited prompt, no effect" failure.
+    //
+    // This pins the block in BOTH interactive and headless renders so a
+    // lost block (or an encryption/template drift) fails the build instead
+    // of silently shipping a model that keeps hallucinating completions.
+
+    #[test]
+    fn action_grounding_block_renders_in_interactive_prompt() {
+        let mut p = default_placeholders();
+        p["is_non_interactive"] = serde_json::json!(false);
+        let prompt = render_base(&default_renderer(), &p);
+        assert!(
+            prompt.contains("<action_grounding>"),
+            "interactive prompt must include the <action_grounding> anti-hallucination block"
+        );
+        assert!(
+            prompt.contains("only way anything gets done in this session is by your tool calls"),
+            "action_grounding core sentence missing from interactive prompt"
+        );
+    }
+
+    #[test]
+    fn action_grounding_block_renders_in_headless_prompt() {
+        let mut p = default_placeholders();
+        p["is_non_interactive"] = serde_json::json!(true);
+        let prompt = render_base(&default_renderer(), &p);
+        assert!(
+            prompt.contains("<action_grounding>"),
+            "headless prompt must include the <action_grounding> anti-hallucination block"
+        );
+        assert!(
+            prompt.contains("headless autonomous session with no human operator"),
+            "headless-specific action_grounding line missing"
+        );
+    }
+
+    // ── verify-after-edit read-back rule ───────────────────────────
+    // The model must re-read a file after editing and confirm the change
+    // on the ACTUAL returned content, rather than trusting the edit tool's
+    // "updated successfully" message (which only proves old_string matched).
+    // Pinned so the stronger anti-hallucination rule can't silently decay.
+
+    #[test]
+    fn action_grounding_requires_read_back_after_edit() {
+        let prompt = render_base(&default_renderer(), &default_placeholders());
+        assert!(
+            prompt.contains("read the file back"),
+            "base prompt must instruct the model to re-read after an edit"
+        );
+        assert!(
+            prompt.contains("Trust the re-read, not the edit tool's message"),
+            "base prompt must tell the model to trust re-read over tool success message"
+        );
+    }
+
+    #[test]
+    fn subagent_prompt_requires_read_back_after_edit() {
+        let prompt = render_subagent(&default_renderer(), &default_placeholders());
+        assert!(
+            prompt.contains("read the file back"),
+            "subagent prompt must instruct the model to re-read after an edit"
+        );
+    }
+
+    // ── tool_usage read-only semantics ─────────────────────────────
+    // The model must not treat read/list/search as "doing" a change:
+    // only edit/write change a file, only execute runs a command. A task
+    // that asks to update a file is NOT fulfilled by inspection alone.
+    // Pinned so this can't silently regress into "read = done".
+
+    #[test]
+    fn base_prompt_states_read_is_read_only() {
+        let prompt = render_base(&default_renderer(), &default_placeholders());
+        assert!(
+            prompt.contains("<tool_usage>"),
+            "base prompt must include the <tool_usage> block"
+        );
+        assert!(
+            prompt.contains("Reading and inspecting do NOT change anything on disk"),
+            "base prompt must state inspection is read-only"
+        );
+        assert!(
+            prompt.contains("only ever inspection"),
+            "base prompt must clarify read/list never fulfill an update request"
+        );
+    }
+
+    #[test]
+    fn subagent_prompt_states_read_is_read_only() {
+        let prompt = render_subagent(&default_renderer(), &default_placeholders());
+        assert!(
+            prompt.contains("<tool_usage>"),
+            "subagent prompt must include the <tool_usage> block"
+        );
+        assert!(
+            prompt.contains("only LOOK at things"),
+            "subagent prompt must clarify read tools are read-only"
+        );
+    }
+
+    // ── no repeated confirmation ────────────────────────────────────
+    // The model must not stall asking "shall I continue?" once the user
+    // has already given a go-ahead. A single yes covers the whole request;
+    // re-asking is the classic agent that never finishes. Pinned so this
+    // anti-stall rule can't be dropped.
+
+    #[test]
+    fn base_prompt_caps_repeated_confirmation() {
+        let prompt = render_base(&default_renderer(), &default_placeholders());
+        // The concern is re-asking, not asking at all. It must (a) limit
+        // confirmation to irreversible/destructive/ambiguous forks, and
+        // (b) forbid asking the same decision twice.
+        assert!(
+            prompt.contains("Never ask the same question twice"),
+            "base prompt must forbid asking the same question twice"
+        );
+        assert!(
+            prompt.contains("Ask for confirmation only when it genuinely adds value"),
+            "base prompt must scope confirmation to genuine forks"
+        );
+    }
+
+    #[test]
+    fn subagent_prompt_caps_repeated_confirmation() {
+        let prompt = render_subagent(&default_renderer(), &default_placeholders());
+        assert!(
+            prompt.contains("never repeat the same question"),
+            "subagent prompt must forbid repeating the same question"
+        );
+    }
+
     #[test]
     fn test_combination_sweep_no_unresolved_variables() {
         let optional = [
