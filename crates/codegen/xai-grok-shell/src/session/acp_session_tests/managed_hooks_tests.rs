@@ -1,11 +1,8 @@
-//! Managed-policy no-disable rule on the hooks-action surface.
+//! A managed-policy hook must not be disabled through `handle_hooks_action`.
 //!
-//! Drives the SHIPPED `handle_hooks_action` with a real registry whose hook
-//! carries requirements provenance: the per-hook `Disable` action must be
-//! refused and the bulk `ToggleSource` must skip it, both before writing any
-//! disable state. (The dispatcher-level exemption and the display predicate
-//! are covered with a sandboxed `GROK_HOME` in `xai_grok_hooks::dispatcher`
-//! tests.)
+//! These tests drive the shipped `handle_hooks_action` with a real registry whose hook carries requirements provenance.
+//! The per-hook `Disable` action must be refused and the bulk `ToggleSource` must skip it, both before writing any disable state.
+//! The dispatcher-level exemption and the display predicate are covered with a sandboxed `GROK_HOME` in `xai_grok_hooks::dispatcher` tests.
 
 use super::support::*;
 use super::*;
@@ -15,13 +12,9 @@ use tokio::sync::mpsc;
 
 const MANAGED_HOOK: &str = "requirements/system:pre_tool_use[0].hooks[0]";
 
-/// Snapshot + restore of the EFFECTIVE disabled-hooks file, wherever the
-/// process resolves it. A temp `GROK_HOME` alone cannot redirect it —
-/// `grok_home()` is `OnceLock`-cached and another test in this binary may
-/// have resolved it first — so the guard lets the test assert nothing was
-/// written (the acceptance criterion) and, if the no-disable rule ever
-/// regresses, restores the developer's or CI's real file instead of
-/// polluting it.
+/// Snapshots and restores the disabled-hooks file wherever the process actually resolves it.
+/// A temp `GROK_HOME` alone cannot redirect it: `grok_home()` is `OnceLock`-cached and another test in this binary may have resolved it first.
+/// The guard lets the test assert nothing was written, and if the no-disable rule ever regresses it restores the developer's or CI's real file.
 struct DisabledHooksGuard {
     path: Option<std::path::PathBuf>,
     before: Option<String>,
@@ -60,7 +53,7 @@ impl Drop for DisabledHooksGuard {
     }
 }
 
-/// Registry with one requirements-provenance command hook.
+/// Builds a registry with one command hook whose provenance is `Requirements`.
 fn managed_registry() -> xai_grok_hooks::discovery::HookRegistry {
     xai_grok_hooks::discovery::registry_from_specs_deduped(vec![xai_grok_hooks::config::HookSpec {
         name: MANAGED_HOOK.to_string(),
@@ -129,6 +122,52 @@ async fn managed_policy_hook_disable_actions_are_refused() {
             );
         })
         .await;
-    // AC: both refusals happened before any disable state was written.
+    // Both refusals happened before any disable state was written
     guard.assert_unchanged();
+}
+
+/// Enable/disable refresh the dispatch snapshot in place, so `hook_run_ctx` never reads the disabled-hooks file itself.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(disabled_hooks_file)]
+async fn toggling_a_hook_refreshes_the_dispatch_snapshot() {
+    const HOOK: &str = "global/qa:pre_tool_use[0].hooks[0]";
+    let _guard = DisabledHooksGuard::capture();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor =
+                Arc::new(create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await);
+            let _ = xai_grok_hooks::trust::enable_hook(HOOK);
+            actor.refresh_hook_disabled();
+            assert!(!actor.hook_run_ctx().disabled().contains(HOOK));
+
+            let outcome = actor
+                .handle_hooks_action(xai_hooks_plugins_types::HooksAction::Disable {
+                    hook_name: HOOK.to_string(),
+                })
+                .await;
+            assert_eq!(
+                outcome.status,
+                xai_hooks_plugins_types::OutcomeStatus::Success
+            );
+            assert!(
+                actor.hook_run_ctx().disabled().contains(HOOK),
+                "the next dispatch must see the disable without reading the file"
+            );
+
+            let outcome = actor
+                .handle_hooks_action(xai_hooks_plugins_types::HooksAction::Enable {
+                    hook_name: HOOK.to_string(),
+                })
+                .await;
+            assert_eq!(
+                outcome.status,
+                xai_hooks_plugins_types::OutcomeStatus::Success
+            );
+            assert!(!actor.hook_run_ctx().disabled().contains(HOOK));
+        })
+        .await;
 }

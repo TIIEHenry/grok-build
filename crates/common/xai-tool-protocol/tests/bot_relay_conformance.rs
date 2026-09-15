@@ -7,13 +7,36 @@
 use serde_json::{Value, json};
 use xai_tool_protocol::{
     BotBindConversationParams, BotCommandParams, BotEmptyResult, BotEventChannel, BotEventEnvelope,
-    BotRelayError, BotRelayErrorCode, BotRosterResult, BotStatusResult, BotSubscribeParams,
-    BotTranscriptOffboxParams, BotTranscriptOffboxResult, BotVncDescriptorResult,
-    COMMAND_REJECTED_AGENT_ID_MISMATCH, HubChannel, HubResyncRequiredEvent, HubTurnFinishedEvent,
+    BotRelayError, BotRelayErrorCode, BotRelaySiblingAccount, BotRelaySignIn, BotRosterResult,
+    BotStatusResult, BotSubscribeParams, BotTranscriptOffboxParams, BotTranscriptOffboxResult,
+    BotVncDescriptorParams, BotVncDescriptorResult, COMMAND_REJECTED_AGENT_ID_MISMATCH,
+    COMMAND_REJECTED_ARGS_INVALID, COMMAND_REJECTED_ARGS_TOO_LARGE,
+    COMMAND_REJECTED_ATTACHMENT_CREDENTIAL_UNAVAILABLE, COMMAND_REJECTED_ATTACHMENT_NOT_FOUND,
+    COMMAND_REJECTED_ATTACHMENT_NOT_READY, COMMAND_REJECTED_ATTACHMENT_TOO_LARGE,
+    COMMAND_REJECTED_ATTACHMENT_WRONG_SOURCE, COMMAND_REJECTED_ATTACHMENTS_NOT_SUPPORTED_IN_LIVE,
+    COMMAND_REJECTED_GATEWAY_UNKNOWN_METHOD, HubChannel, HubResyncRequiredEvent,
+    HubTurnFinishedEvent,
 };
 
 const ERROR_IDENTITY_UNAVAILABLE: &str =
     include_str!("../fixtures/bot_relay/error_identity_unavailable.json");
+const ERROR_LINK_REQUIRED: &str = include_str!("../fixtures/bot_relay/error_link_required.json");
+const ERROR_LINK_REMOVED: &str = include_str!("../fixtures/bot_relay/error_link_removed.json");
+const ERROR_CONSENT_REQUIRED: &str =
+    include_str!("../fixtures/bot_relay/error_consent_required.json");
+const ERROR_ENTERPRISE_UNSUPPORTED: &str =
+    include_str!("../fixtures/bot_relay/error_enterprise_unsupported.json");
+const ERROR_LEGACY_PRICING_UNSUPPORTED: &str =
+    include_str!("../fixtures/bot_relay/error_legacy_pricing_unsupported.json");
+const ERROR_EMAIL_UNVERIFIED: &str =
+    include_str!("../fixtures/bot_relay/error_email_unverified.json");
+const ERROR_LINK_CONFLICT: &str = include_str!("../fixtures/bot_relay/error_link_conflict.json");
+const ERROR_LINK_CONFLICT_SIBLINGS: &str =
+    include_str!("../fixtures/bot_relay/error_link_conflict_siblings.json");
+const ERROR_CURSOR_ACCOUNT_UNAVAILABLE: &str =
+    include_str!("../fixtures/bot_relay/error_cursor_account_unavailable.json");
+const ERROR_LINK_UNSUPPORTED: &str =
+    include_str!("../fixtures/bot_relay/error_link_unsupported.json");
 const ERROR_NO_PLAN: &str = include_str!("../fixtures/bot_relay/error_no_plan.json");
 const ERROR_USAGE_EXHAUSTED: &str =
     include_str!("../fixtures/bot_relay/error_usage_exhausted.json");
@@ -25,6 +48,26 @@ const ERROR_COMMAND_REJECTED: &str =
     include_str!("../fixtures/bot_relay/error_command_rejected.json");
 const ERROR_COMMAND_REJECTED_AGENT_ID_MISMATCH: &str =
     include_str!("../fixtures/bot_relay/error_command_rejected_agent_id_mismatch.json");
+const ERROR_COMMAND_REJECTED_ARGS_TOO_LARGE: &str =
+    include_str!("../fixtures/bot_relay/error_command_rejected_args_too_large.json");
+const ERROR_COMMAND_REJECTED_ARGS_INVALID: &str =
+    include_str!("../fixtures/bot_relay/error_command_rejected_args_invalid.json");
+const ERROR_COMMAND_REJECTED_ATTACHMENTS_NOT_SUPPORTED_IN_LIVE: &str = include_str!(
+    "../fixtures/bot_relay/error_command_rejected_attachments_not_supported_in_live.json"
+);
+const ERROR_COMMAND_REJECTED_ATTACHMENT_CREDENTIAL_UNAVAILABLE: &str = include_str!(
+    "../fixtures/bot_relay/error_command_rejected_attachment_credential_unavailable.json"
+);
+const ERROR_COMMAND_REJECTED_ATTACHMENT_NOT_FOUND: &str =
+    include_str!("../fixtures/bot_relay/error_command_rejected_attachment_not_found.json");
+const ERROR_COMMAND_REJECTED_ATTACHMENT_WRONG_SOURCE: &str =
+    include_str!("../fixtures/bot_relay/error_command_rejected_attachment_wrong_source.json");
+const ERROR_COMMAND_REJECTED_ATTACHMENT_TOO_LARGE: &str =
+    include_str!("../fixtures/bot_relay/error_command_rejected_attachment_too_large.json");
+const ERROR_COMMAND_REJECTED_ATTACHMENT_NOT_READY: &str =
+    include_str!("../fixtures/bot_relay/error_command_rejected_attachment_not_ready.json");
+const ERROR_COMMAND_REJECTED_GATEWAY_UNKNOWN_METHOD: &str =
+    include_str!("../fixtures/bot_relay/error_command_rejected_gateway_unknown_method.json");
 const ERROR_COMPUTER_UNAVAILABLE: &str =
     include_str!("../fixtures/bot_relay/error_computer_unavailable.json");
 const ERROR_UPSTREAM_ERROR: &str = include_str!("../fixtures/bot_relay/error_upstream_error.json");
@@ -52,6 +95,8 @@ const METHOD_COMMAND_PARAMS: &str =
     include_str!("../fixtures/bot_relay/method_command_params.json");
 const METHOD_COMMAND_RESULT: &str =
     include_str!("../fixtures/bot_relay/method_command_result.json");
+const METHOD_VNC_DESCRIPTOR_PARAMS: &str =
+    include_str!("../fixtures/bot_relay/method_vnc_descriptor_params.json");
 const METHOD_VNC_DESCRIPTOR_RESULT: &str =
     include_str!("../fixtures/bot_relay/method_vnc_descriptor_result.json");
 const METHOD_ROSTER_RESULT: &str = include_str!("../fixtures/bot_relay/method_roster_result.json");
@@ -130,6 +175,78 @@ fn handwritten_error_fixtures() {
             retryable: true,
             detail: json!({}),
             reason: None,
+            detail_upstream: None,
+        },
+        Case {
+            code: BotRelayErrorCode::LinkRequired,
+            raw: ERROR_LINK_REQUIRED,
+            retryable: false,
+            detail: json!({}),
+            reason: Some("no_link"),
+            detail_upstream: None,
+        },
+        Case {
+            code: BotRelayErrorCode::LinkRemoved,
+            raw: ERROR_LINK_REMOVED,
+            retryable: false,
+            detail: json!({}),
+            reason: Some("unlinked"),
+            detail_upstream: None,
+        },
+        Case {
+            code: BotRelayErrorCode::ConsentRequired,
+            raw: ERROR_CONSENT_REQUIRED,
+            retryable: false,
+            detail: json!({}),
+            reason: Some("jit_consent_required"),
+            detail_upstream: None,
+        },
+        Case {
+            code: BotRelayErrorCode::EnterpriseUnsupported,
+            raw: ERROR_ENTERPRISE_UNSUPPORTED,
+            retryable: false,
+            detail: json!({}),
+            reason: Some("jit_enterprise_member"),
+            detail_upstream: None,
+        },
+        Case {
+            code: BotRelayErrorCode::LegacyPricingUnsupported,
+            raw: ERROR_LEGACY_PRICING_UNSUPPORTED,
+            retryable: false,
+            detail: json!({}),
+            reason: Some("jit_legacy_pricing"),
+            detail_upstream: None,
+        },
+        Case {
+            code: BotRelayErrorCode::EmailUnverified,
+            raw: ERROR_EMAIL_UNVERIFIED,
+            retryable: false,
+            detail: json!({}),
+            reason: Some("jit_email_unverified"),
+            detail_upstream: None,
+        },
+        Case {
+            code: BotRelayErrorCode::LinkConflict,
+            raw: ERROR_LINK_CONFLICT,
+            retryable: false,
+            detail: json!({}),
+            reason: Some("jit_link_declined"),
+            detail_upstream: None,
+        },
+        Case {
+            code: BotRelayErrorCode::CursorAccountUnavailable,
+            raw: ERROR_CURSOR_ACCOUNT_UNAVAILABLE,
+            retryable: false,
+            detail: json!({}),
+            reason: Some("user_missing"),
+            detail_upstream: None,
+        },
+        Case {
+            code: BotRelayErrorCode::LinkUnsupported,
+            raw: ERROR_LINK_UNSUPPORTED,
+            retryable: false,
+            detail: json!({}),
+            reason: Some("jit_some_future_rule"),
             detail_upstream: None,
         },
         Case {
@@ -236,6 +353,153 @@ fn handwritten_agent_id_mismatch_reason() {
 }
 
 #[test]
+fn handwritten_args_too_large_reason() {
+    let err = assert_error(
+        ERROR_COMMAND_REJECTED_ARGS_TOO_LARGE,
+        "command_rejected",
+        false,
+        json!({}),
+        Some(COMMAND_REJECTED_ARGS_TOO_LARGE),
+        BotRelayErrorCode::CommandRejected,
+    );
+    assert_eq!(err.detail.upstream, None);
+}
+
+#[test]
+fn handwritten_args_invalid_reason() {
+    let err = assert_error(
+        ERROR_COMMAND_REJECTED_ARGS_INVALID,
+        "command_rejected",
+        false,
+        json!({}),
+        Some(COMMAND_REJECTED_ARGS_INVALID),
+        BotRelayErrorCode::CommandRejected,
+    );
+    assert_eq!(err.detail.upstream, None);
+}
+
+#[test]
+fn handwritten_attachments_not_supported_in_live_reason() {
+    let err = assert_error(
+        ERROR_COMMAND_REJECTED_ATTACHMENTS_NOT_SUPPORTED_IN_LIVE,
+        "command_rejected",
+        false,
+        json!({}),
+        Some(COMMAND_REJECTED_ATTACHMENTS_NOT_SUPPORTED_IN_LIVE),
+        BotRelayErrorCode::CommandRejected,
+    );
+    assert_eq!(err.detail.upstream, None);
+}
+
+#[test]
+fn handwritten_attach_upload_reject_reasons() {
+    for (raw, reason) in [
+        (
+            ERROR_COMMAND_REJECTED_ATTACHMENT_CREDENTIAL_UNAVAILABLE,
+            COMMAND_REJECTED_ATTACHMENT_CREDENTIAL_UNAVAILABLE,
+        ),
+        (
+            ERROR_COMMAND_REJECTED_ATTACHMENT_NOT_FOUND,
+            COMMAND_REJECTED_ATTACHMENT_NOT_FOUND,
+        ),
+        (
+            ERROR_COMMAND_REJECTED_ATTACHMENT_WRONG_SOURCE,
+            COMMAND_REJECTED_ATTACHMENT_WRONG_SOURCE,
+        ),
+        (
+            ERROR_COMMAND_REJECTED_ATTACHMENT_TOO_LARGE,
+            COMMAND_REJECTED_ATTACHMENT_TOO_LARGE,
+        ),
+        (
+            ERROR_COMMAND_REJECTED_ATTACHMENT_NOT_READY,
+            COMMAND_REJECTED_ATTACHMENT_NOT_READY,
+        ),
+    ] {
+        let err = assert_error(
+            raw,
+            "command_rejected",
+            false,
+            json!({}),
+            Some(reason),
+            BotRelayErrorCode::CommandRejected,
+        );
+        assert_eq!(err.detail.upstream, None);
+    }
+}
+
+#[test]
+fn handwritten_gateway_unknown_method_reason() {
+    let err = assert_error(
+        ERROR_COMMAND_REJECTED_GATEWAY_UNKNOWN_METHOD,
+        "command_rejected",
+        false,
+        json!({}),
+        Some(COMMAND_REJECTED_GATEWAY_UNKNOWN_METHOD),
+        BotRelayErrorCode::CommandRejected,
+    );
+    assert_eq!(err.detail.upstream, None);
+}
+
+#[test]
+fn handwritten_link_conflict_siblings() {
+    let (wire, err) = replay_error(ERROR_LINK_CONFLICT_SIBLINGS);
+    assert_eq!(wire["code"], "link_conflict");
+    assert_eq!(wire["reason"], "jit_link_declined");
+    assert_eq!(
+        wire["detail"]["siblingAccounts"].as_array().map(Vec::len),
+        Some(3)
+    );
+    assert_eq!(err.code, BotRelayErrorCode::LinkConflict);
+    assert_eq!(err.reason.as_deref(), Some("jit_link_declined"));
+    assert_eq!(err.detail.upstream, None);
+    let siblings = err
+        .detail
+        .sibling_accounts
+        .as_deref()
+        .expect("siblingAccounts");
+    assert_eq!(
+        siblings,
+        [
+            BotRelaySiblingAccount {
+                sign_in: BotRelaySignIn::X,
+                handle: Some("grokfan".to_owned()),
+                created_at_ms: 1_699_920_000_000,
+                linked: true,
+            },
+            BotRelaySiblingAccount {
+                sign_in: BotRelaySignIn::Apple,
+                handle: None,
+                created_at_ms: 1_717_200_000_000,
+                linked: false,
+            },
+            BotRelaySiblingAccount {
+                sign_in: BotRelaySignIn::Other,
+                handle: None,
+                created_at_ms: 0,
+                linked: false,
+            },
+        ]
+    );
+    assert_eq!(siblings.iter().filter(|s| s.linked).count(), 1);
+    let reserialized = serde_json::to_value(&err).unwrap();
+    assert_eq!(
+        reserialized["detail"]["siblingAccounts"][0],
+        wire["detail"]["siblingAccounts"][0]
+    );
+    assert_eq!(
+        reserialized["detail"]["siblingAccounts"][1],
+        wire["detail"]["siblingAccounts"][1]
+    );
+    assert_eq!(
+        reserialized["detail"]["siblingAccounts"][2]["signIn"],
+        "other"
+    );
+    for sign_in in BotRelaySignIn::ALL {
+        assert_eq!(BotRelaySignIn::from_wire(sign_in.as_str()), *sign_in);
+    }
+}
+
+#[test]
 fn unknown_error_code_degrades_to_upstream_error() {
     let (wire, err) = replay_error(ERROR_UNKNOWN_CODE);
     assert_eq!(wire["code"], "some_future_code");
@@ -249,6 +513,9 @@ fn unknown_error_code_degrades_to_upstream_error() {
     assert_eq!(err.reason, None);
 }
 
+// Wire schema: `preview` is a required string and may be non-empty.
+// The hub emitter always sends ""; this fixture proves the field is not
+// constrained to empty.
 #[test]
 fn hub_turn_finished_envelope() {
     let (wire, env) = replay_envelope(EVENT_HUB_TURN_FINISHED);
@@ -442,6 +709,13 @@ fn method_command_params_and_result() {
 
     let result: Value = serde_json::from_str(METHOD_COMMAND_RESULT).expect("command result");
     assert_eq!(result, json!({"accepted": true}));
+}
+
+#[test]
+fn method_vnc_descriptor_params_require_agent_id() {
+    let params: BotVncDescriptorParams =
+        serde_json::from_str(METHOD_VNC_DESCRIPTOR_PARAMS).expect("vnc params");
+    assert_eq!(params.agent_id, "agt_1");
 }
 
 #[test]

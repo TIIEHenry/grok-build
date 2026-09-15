@@ -1,15 +1,12 @@
 //! Tests run against the real store in temp directories only.
 //!
-//! Deliberately untested: the busy-budget exhaustion mapping to the typed
-//! busy error. Forcing it needs a peer connection holding the write lock
-//! past the journal crate's multi-second busy budget, which would dominate
-//! the suite's runtime; the mapping is one shared helper on every
-//! operation's path.
+//! Deliberately untested: the mapping from an exhausted busy budget to the typed busy error.
+//! Forcing it needs a peer connection holding the write lock past the journal crate's multi-second busy budget.
+//! That wait would dominate the suite's runtime, and the mapping is one shared helper on every operation's path.
 
 use std::time::Duration;
 
-// One contended write may consume SQLite's five-second busy timeout; this
-// deadline detects a hung phase without racing that valid wait.
+// One contended write may consume SQLite's five-second busy timeout; this deadline detects a hung phase without racing that valid wait
 const TEST_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn recv_phase(receiver: &std::sync::mpsc::Receiver<()>, phase: &str) {
@@ -24,7 +21,7 @@ use tempfile::TempDir;
 use super::*;
 use crate::default_db_path;
 use crate::test_support::{expected_member, member_key, new_member};
-use crate::types::RANK_GAP;
+use crate::types::{LayoutGrouping, RANK_GAP};
 
 fn temp_store() -> (TempDir, WorkspaceStore) {
     let tmp = TempDir::new().unwrap();
@@ -36,6 +33,13 @@ fn assign(id: &str, kind: MemberKind, rank: Option<i64>) -> RankAssignment {
     RankAssignment {
         key: member_key(id, kind),
         rank,
+    }
+}
+
+fn pin(id: &str, kind: MemberKind, pinned: bool) -> PinAssignment {
+    PinAssignment {
+        key: member_key(id, kind),
+        pinned,
     }
 }
 
@@ -143,9 +147,8 @@ fn open_creates_schema_and_roundtrips_snapshot() {
 #[test]
 fn eviction_at_capacity_is_lru_transactional_and_deterministic() {
     let (_tmp, mut store) = temp_store();
-    // Three members tie on last_change_unix_ms so both tie-break keys are
-    // exercised: kind ("build" before "conversation" within m000) and
-    // session_id (m000 before m001).
+    // Three members tie on last_change_unix_ms so both tie-break keys are exercised
+    // The kind key orders "build" before "conversation" within m000; the session_id key orders m000 before m001
     for tied in [
         new_member("m000", MemberKind::Build, MemberOrigin::Local, 1000),
         new_member("m000", MemberKind::Conversation, MemberOrigin::Local, 1000),
@@ -197,8 +200,7 @@ fn eviction_at_capacity_is_lru_transactional_and_deterministic() {
             .contains(&expected_member(&second, None, None))
     );
 
-    // Overfull file (past bug or lowered capacity) with fewer unpinned rows
-    // than the overage: every unpinned row is evicted, the insert proceeds.
+    // Overfull file (past bug or lowered capacity) with fewer unpinned rows than the overage: every unpinned row is evicted, the insert proceeds
     let tmp = TempDir::new().unwrap();
     let db = default_db_path(tmp.path());
     let effective = WorkspaceStore::open(&db).unwrap().path().to_path_buf();
@@ -249,9 +251,14 @@ fn pinned_members_are_never_evicted_and_all_pinned_refuses() {
             ))
             .unwrap();
     }
-    store
-        .set_pin_rank(&[assign("m000", MemberKind::Build, Some(RANK_GAP))])
-        .unwrap();
+    assert!(matches!(
+        store.apply_layout_patch(&LayoutPatch {
+            pin_assignments: vec![pin("m000", MemberKind::Build, true)],
+            manual_order: None,
+            grouping: None,
+        }),
+        LayoutApplyOutcome::Committed(_)
+    ));
 
     let newcomer = new_member("z-new", MemberKind::Build, MemberOrigin::Local, 9999);
     assert_eq!(
@@ -260,21 +267,27 @@ fn pinned_members_are_never_evicted_and_all_pinned_refuses() {
         "the pinned oldest member is exempt; the next-oldest goes"
     );
 
-    let all_pinned: Vec<RankAssignment> = store
+    let all_pinned: Vec<PinAssignment> = store
         .snapshot()
         .unwrap()
         .members
         .iter()
-        .enumerate()
-        .map(|(i, m)| RankAssignment {
+        .map(|m| PinAssignment {
             key: MemberKey {
                 session_id: m.session_id.clone(),
                 kind: m.kind.clone(),
             },
-            rank: Some((i as i64 + 1) * RANK_GAP),
+            pinned: true,
         })
         .collect();
-    store.set_pin_rank(&all_pinned).unwrap();
+    assert!(matches!(
+        store.apply_layout_patch(&LayoutPatch {
+            pin_assignments: all_pinned,
+            manual_order: None,
+            grouping: None,
+        }),
+        LayoutApplyOutcome::Committed(_)
+    ));
 
     let before = store.snapshot().unwrap();
     let error = store
@@ -321,8 +334,7 @@ fn rekey_moves_row_and_ranks_atomically_and_merges_on_conflict() {
     moved.session_id = SessionId::new("a-new").unwrap();
     assert_eq!(store.snapshot().unwrap().members, vec![moved.clone()]);
 
-    // Merge arm: the target keeps origin/metadata and its own order_rank;
-    // its NULL pin_rank is filled from the old row; the old row is gone.
+    // Merge arm: the target keeps origin/metadata and its own order_rank; its NULL pin_rank is filled from the old row; the old row is gone
     let target = new_member("target", MemberKind::Conversation, MemberOrigin::Local, 200);
     store.insert_member(target.clone()).unwrap();
     store
@@ -348,8 +360,7 @@ fn rekey_moves_row_and_ranks_atomically_and_merges_on_conflict() {
         vec![moved.clone(), merged.clone()]
     );
 
-    // Self-rekey: reports NoChange and must not fall into the merge arm's
-    // delete.
+    // Self-rekey: reports NoChange and must not fall into the merge arm's delete
     assert_eq!(
         store
             .rekey(&target.key, SessionId::new("target").unwrap())
@@ -358,9 +369,8 @@ fn rekey_moves_row_and_ranks_atomically_and_merges_on_conflict() {
     );
     assert_eq!(store.snapshot().unwrap().members, vec![moved, merged]);
 
-    // A missing old key errors with nothing changed, whatever the target:
-    // absent, self, or an existing member — the last must not slip into the
-    // merge arm and report a merge that never happened.
+    // A missing old key errors with nothing changed, whatever the target: absent, self, or an existing member
+    // The last must not slip into the merge arm and report a merge that never happened
     let ghost = member_key("ghost", MemberKind::Build);
     let before = store.snapshot().unwrap();
     assert!(matches!(
@@ -479,8 +489,7 @@ fn metadata_update_never_touches_origin_or_ranks() {
         .set_order_rank(&[assign("keep", MemberKind::Build, Some(2 * RANK_GAP))])
         .unwrap();
 
-    // First metadata path: re-insert with changed metadata and a different
-    // origin in the payload — the stored origin and ranks must survive.
+    // First metadata path: re-insert with changed metadata and a different origin in the payload; the stored origin and ranks must survive
     let mut adopted = new_member("keep", MemberKind::Build, MemberOrigin::Local, 500);
     adopted.metadata.title = Some("adopted title".to_owned());
     assert_eq!(
@@ -525,7 +534,7 @@ fn rank_batch_is_atomic_and_grouping_persists() {
         })
         .collect();
 
-    // The renumber primitive: every row's rank rewritten in one call.
+    // The renumber operation: every row's rank rewritten in one call
     store
         .set_order_rank(&[
             assign("r0", MemberKind::Build, Some(RANK_GAP)),
@@ -542,7 +551,7 @@ fn rank_batch_is_atomic_and_grouping_persists() {
         ]
     );
 
-    // A batch with one missing key must change nothing at all.
+    // A batch with one missing key must change nothing
     let before = store.snapshot().unwrap();
     assert!(matches!(
         store.set_order_rank(&[
@@ -574,13 +583,265 @@ fn rank_batch_is_atomic_and_grouping_persists() {
 }
 
 #[test]
+fn layout_patch_commits_one_snapshot_and_rewrites_complete_order_subset() {
+    let (_tmp, mut store) = temp_store();
+    let a = new_member("a", MemberKind::Build, MemberOrigin::Local, 1);
+    let b = new_member("b", MemberKind::Build, MemberOrigin::Local, 2);
+    let c = new_member("c", MemberKind::Build, MemberOrigin::Local, 3);
+    for member in [&a, &b, &c] {
+        store.insert_member(member.clone()).unwrap();
+    }
+    store
+        .set_order_rank(&[
+            assign("a", MemberKind::Build, Some(9)),
+            assign("c", MemberKind::Build, Some(10)),
+        ])
+        .unwrap();
+
+    let outcome = store.apply_layout_patch(&LayoutPatch {
+        pin_assignments: vec![pin("b", MemberKind::Build, true)],
+        manual_order: Some(vec![b.key.clone(), a.key.clone()]),
+        grouping: Some(LayoutGrouping::Directory),
+    });
+    let LayoutApplyOutcome::Committed(snapshot) = outcome else {
+        panic!("layout patch should commit");
+    };
+
+    assert_eq!(snapshot.grouping, Grouping::Directory);
+    assert_eq!(
+        snapshot.members,
+        vec![
+            expected_member(&a, None, Some(2 * RANK_GAP)),
+            expected_member(&b, Some(RANK_GAP), Some(RANK_GAP)),
+            expected_member(&c, None, None),
+        ]
+    );
+    assert_eq!(store.snapshot().unwrap(), snapshot);
+}
+
+#[test]
+fn missing_layout_member_rolls_back_every_field_and_returns_reliable_snapshot() {
+    let (_tmp, mut store) = temp_store();
+    let a = new_member("a", MemberKind::Build, MemberOrigin::Local, 1);
+    store.insert_member(a).unwrap();
+    let before = store.snapshot().unwrap();
+
+    let outcome = store.apply_layout_patch(&LayoutPatch {
+        pin_assignments: vec![pin("a", MemberKind::Build, true)],
+        manual_order: Some(vec![member_key("missing", MemberKind::Build)]),
+        grouping: Some(LayoutGrouping::Directory),
+    });
+    let LayoutApplyOutcome::Rejected { error, snapshot } = outcome else {
+        panic!("missing member should reject with rollback snapshot");
+    };
+
+    assert!(matches!(
+        error,
+        StoreError::MemberNotFound { session_id, .. } if session_id == "missing"
+    ));
+    assert_eq!(snapshot, before);
+    assert_eq!(store.snapshot().unwrap(), before);
+}
+
+#[test]
+fn layout_commit_failure_returns_no_snapshot_and_leaves_committed_state_unchanged() {
+    let (_tmp, mut store) = temp_store();
+    let a = new_member("a", MemberKind::Build, MemberOrigin::Local, 1);
+    store.insert_member(a.clone()).unwrap();
+    store
+        .conn
+        .execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE layout_test_parent (id INTEGER PRIMARY KEY);
+             CREATE TABLE layout_test_child (
+                 parent_id INTEGER REFERENCES layout_test_parent(id)
+                     DEFERRABLE INITIALLY DEFERRED
+             );
+             CREATE TRIGGER layout_test_commit_failure
+             AFTER UPDATE OF pin_rank ON members
+             BEGIN
+                 INSERT INTO layout_test_child(parent_id) VALUES (999);
+             END;",
+        )
+        .unwrap();
+
+    let outcome = store.apply_layout_patch(&LayoutPatch {
+        pin_assignments: vec![pin("a", MemberKind::Build, true)],
+        manual_order: None,
+        grouping: None,
+    });
+
+    assert!(matches!(
+        outcome,
+        LayoutApplyOutcome::Failed {
+            error: StoreError::Sqlite(_)
+        }
+    ));
+    assert_eq!(
+        store.snapshot().unwrap().members,
+        vec![expected_member(&a, None, None)]
+    );
+}
+
+#[test]
+fn layout_patch_reports_newer_schema_as_typed_failed_outcome() {
+    let tmp = TempDir::new().unwrap();
+    let db = default_db_path(tmp.path());
+    let mut store = WorkspaceStore::open(&db).unwrap();
+    let peer = rusqlite::Connection::open(store.path()).unwrap();
+    peer.pragma_update(None, "user_version", USER_VERSION + 1)
+        .unwrap();
+    drop(peer);
+
+    let outcome = store.apply_layout_patch(&LayoutPatch {
+        pin_assignments: vec![],
+        manual_order: None,
+        grouping: Some(LayoutGrouping::Directory),
+    });
+
+    assert!(matches!(
+        outcome,
+        LayoutApplyOutcome::Failed {
+            error: StoreError::NewerSchema {
+                found,
+                supported: USER_VERSION
+            }
+        } if found == USER_VERSION + 1
+    ));
+    assert_eq!(
+        store.schema_state(),
+        SchemaState::NewerReadOnly {
+            user_version: USER_VERSION + 1
+        }
+    );
+}
+
+#[test]
+fn layout_patch_public_boundary_rejects_invalid_semantics() {
+    let (_tmp, mut store) = temp_store();
+    let invalid = [
+        LayoutPatch {
+            pin_assignments: vec![pin("chat", MemberKind::Conversation, true)],
+            manual_order: None,
+            grouping: None,
+        },
+        LayoutPatch {
+            pin_assignments: vec![],
+            manual_order: Some(vec![member_key("chat", MemberKind::Conversation)]),
+            grouping: None,
+        },
+    ];
+
+    for patch in invalid {
+        assert!(matches!(
+            store.apply_layout_patch(&patch),
+            LayoutApplyOutcome::Failed {
+                error: StoreError::InvalidLayoutPatch { .. }
+            }
+        ));
+    }
+}
+
+#[test]
+fn layout_patch_deduplicates_public_assignments_before_writing() {
+    let (_tmp, mut store) = temp_store();
+    let a = new_member("a", MemberKind::Build, MemberOrigin::Local, 1);
+    store.insert_member(a.clone()).unwrap();
+
+    let outcome = store.apply_layout_patch(&LayoutPatch {
+        pin_assignments: vec![
+            pin("a", MemberKind::Build, false),
+            pin("a", MemberKind::Build, true),
+        ],
+        manual_order: Some(vec![a.key.clone(), a.key.clone()]),
+        grouping: None,
+    });
+    let LayoutApplyOutcome::Committed(snapshot) = outcome else {
+        panic!("deduplicated patch should commit");
+    };
+    assert_eq!(
+        snapshot.members,
+        vec![expected_member(&a, Some(RANK_GAP), Some(RANK_GAP))]
+    );
+}
+
+#[test]
+fn pin_only_layout_patch_preserves_unknown_grouping() {
+    let (_tmp, mut store) = temp_store();
+    let a = new_member("a", MemberKind::Build, MemberOrigin::Local, 1);
+    store.insert_member(a).unwrap();
+    let future = Grouping::from_raw("future-grouping").unwrap();
+    store.set_grouping(&future).unwrap();
+
+    let outcome = store.apply_layout_patch(&LayoutPatch {
+        pin_assignments: vec![pin("a", MemberKind::Build, true)],
+        manual_order: None,
+        grouping: None,
+    });
+    let LayoutApplyOutcome::Committed(snapshot) = outcome else {
+        panic!("pin-only patch should commit");
+    };
+    assert_eq!(snapshot.grouping, future);
+}
+
+#[test]
+fn remove_and_reinsert_resets_member_layout() {
+    let (_tmp, mut store) = temp_store();
+    let a = new_member("a", MemberKind::Build, MemberOrigin::Local, 1);
+    store.insert_member(a.clone()).unwrap();
+    assert!(matches!(
+        store.apply_layout_patch(&LayoutPatch {
+            pin_assignments: vec![pin("a", MemberKind::Build, true)],
+            manual_order: Some(vec![a.key.clone()]),
+            grouping: None,
+        }),
+        LayoutApplyOutcome::Committed(_)
+    ));
+
+    store.remove_member(&a.key).unwrap();
+    store.insert_member(a.clone()).unwrap();
+
+    assert_eq!(
+        store.snapshot().unwrap().members,
+        vec![expected_member(&a, None, None)]
+    );
+}
+
+#[test]
+fn peer_layout_patch_advances_data_version_and_converges_snapshot() {
+    let tmp = TempDir::new().unwrap();
+    let db = default_db_path(tmp.path());
+    let mut local = WorkspaceStore::open(&db).unwrap();
+    let a = new_member("a", MemberKind::Build, MemberOrigin::Local, 1);
+    local.insert_member(a.clone()).unwrap();
+    let baseline = local.snapshot().unwrap().data_version;
+    let mut peer = WorkspaceStore::open(&db).unwrap();
+
+    assert!(matches!(
+        peer.apply_layout_patch(&LayoutPatch {
+            pin_assignments: vec![pin("a", MemberKind::Build, true)],
+            manual_order: Some(vec![a.key.clone()]),
+            grouping: Some(LayoutGrouping::Directory),
+        }),
+        LayoutApplyOutcome::Committed(_)
+    ));
+
+    assert_ne!(local.data_version().unwrap(), baseline);
+    let refreshed = local.snapshot().unwrap();
+    assert_eq!(refreshed.grouping, Grouping::Directory);
+    assert_eq!(
+        refreshed.members,
+        vec![expected_member(&a, Some(RANK_GAP), Some(RANK_GAP))]
+    );
+}
+
+#[test]
 fn two_connections_interleave_without_loss_and_data_version_fires_foreign_only() {
     let tmp = TempDir::new().unwrap();
     let db = default_db_path(tmp.path());
 
     let mut a = WorkspaceStore::open(&db).unwrap();
-    // The snapshot-embedded value is the poll baseline: the two must agree
-    // when nothing happened in between.
+    // The data_version inside the snapshot is the poll baseline: the two must agree when nothing happened in between
     let base_a = a.snapshot().unwrap().data_version;
     let m1 = new_member("m1", MemberKind::Build, MemberOrigin::Local, 100);
     a.insert_member(m1.clone()).unwrap();
@@ -641,9 +902,7 @@ fn two_connections_interleave_without_loss_and_data_version_fires_foreign_only()
             base_b2,
             "a healthy reopen commits zero pages and must not look foreign"
         );
-        // The peer waits for this ack before its first commit, so the poll
-        // above cannot observe a legitimate foreign change instead of the
-        // reopen.
+        // The peer waits for this ack before its first commit, so the poll above cannot observe a legitimate foreign change instead of the reopen
         b_events.send(()).unwrap();
         for i in 0..10i64 {
             b.insert_member(new_member(
@@ -686,9 +945,8 @@ fn two_connections_interleave_without_loss_and_data_version_fires_foreign_only()
     a_events.send(()).unwrap();
     recv_phase(&b_events_rx, "connection B phase");
 
-    // Unsynchronized concurrent inserts from both connections: contention,
-    // when the scheduler produces it, rides the busy timeout; no write may
-    // be lost either way.
+    // Unsynchronized concurrent inserts from both connections
+    // When the scheduler produces contention the busy timeout absorbs it; no write may be lost either way
     for i in 0..10i64 {
         a.insert_member(new_member(
             &format!("a{i:02}"),

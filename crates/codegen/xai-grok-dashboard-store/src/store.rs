@@ -1,25 +1,65 @@
 //! The workspace store: connection ownership and all store operations.
 //! The open/create flow lives in `store_open`.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
-use crate::error::{Result, StoreError, classify_busy};
+use crate::error::{Result, StoreError, classify_busy, classify_unusable};
 use crate::schema::{USER_VERSION, read_user_version};
 use crate::types::{
-    Grouping, InsertOutcome, Member, MemberKey, MemberKind, MemberMetadata, MemberOrigin,
-    NewMember, RankAssignment, RekeyOutcome, RemoveOutcome, SchemaState, SessionId,
-    ValidatedMetadataRef, WORKSPACE_CAPACITY, WorkspaceSnapshot,
+    Grouping, InsertOutcome, LayoutApplyOutcome, LayoutPatch, Member, MemberKey, MemberKind,
+    MemberMetadata, MemberOrigin, NewMember, PinAssignment, RANK_GAP, RankAssignment, RekeyOutcome,
+    RemoveOutcome, SchemaState, SessionId, ValidatedMetadataRef, WORKSPACE_CAPACITY,
+    WorkspaceSnapshot,
 };
 
 const MEMBER_EXISTS_SQL: &str =
     "SELECT EXISTS(SELECT 1 FROM members WHERE session_id = ?1 AND kind = ?2)";
 
-// The conflict arm touches metadata columns only: origin and the rank
-// columns are absent, so adopting an existing member can never rewrite
-// them.
+fn read_snapshot(conn: &rusqlite::Connection) -> Result<WorkspaceSnapshot> {
+    let grouping: String = conn.query_row("SELECT grouping FROM meta WHERE id = 0", [], |row| {
+        row.get(0)
+    })?;
+    let mut stmt = conn.prepare(
+        "SELECT session_id, kind, origin, cwd, title, model, last_turn_summary,
+                is_worktree, last_change_unix_ms, pin_rank, order_rank
+         FROM members ORDER BY session_id, kind",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(Member {
+            session_id: SessionId::new(row.get::<_, String>(0)?).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+            kind: MemberKind::from_stored(row.get(1)?),
+            origin: MemberOrigin::from_stored(row.get(2)?),
+            cwd: row.get(3)?,
+            title: row.get(4)?,
+            model: row.get(5)?,
+            last_turn_summary: row.get(6)?,
+            is_worktree: row.get(7)?,
+            last_change_unix_ms: row.get(8)?,
+            pin_rank: row.get(9)?,
+            order_rank: row.get(10)?,
+        })
+    })?;
+    let members = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let data_version: i64 = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+    Ok(WorkspaceSnapshot {
+        grouping: Grouping::from_stored(grouping),
+        members,
+        data_version,
+    })
+}
+
+// The conflict arm touches metadata columns only: origin and the rank columns are absent, so adopting an existing member can never rewrite them
 const UPSERT_MEMBER_SQL: &str = "
 INSERT INTO members (session_id, kind, origin, cwd, title, model,
                      last_turn_summary, is_worktree, last_change_unix_ms)
@@ -30,10 +70,9 @@ ON CONFLICT(session_id, kind) DO UPDATE SET
     is_worktree = excluded.is_worktree,
     last_change_unix_ms = excluded.last_change_unix_ms";
 
-// Row-value IN (not `DELETE ... LIMIT`, which needs a non-default SQLite
-// compile flag); ties on last_change_unix_ms break on (session_id, kind)
-// ascending so two processes racing the same insert converge on the same
-// victim. `:excess` > 1 self-heals an overfull file.
+// The delete uses a row-value IN, not `DELETE ... LIMIT`, which needs a non-default SQLite compile flag.
+// Ties on last_change_unix_ms break on (session_id, kind) ascending, so two processes racing the same insert converge on the same victim
+// An `:excess` above 1 heals an overfull file
 const EVICT_SQL: &str = "
 DELETE FROM members
 WHERE (session_id, kind) IN (
@@ -59,12 +98,14 @@ enum InsertTransactionOutcome {
     },
 }
 
-/// Owns the single connection. `Send` but not `Sync` (`rusqlite::Connection`);
-/// no interior locks — writes take `&mut self` and consumers serialize
-/// access on one owned handle per process.
-///
-/// Opening is creating: `open` makes the parent directory and database file
-/// exist. A caller that must not create the store must not call it.
+enum WriteAttempt<T> {
+    Committed(T),
+    RolledBack(StoreError),
+    Failed(StoreError),
+}
+
+/// Owns the single connection. `Send` but not `Sync` (`rusqlite::Connection`), with no interior locks.
+/// A caller that must not create the store must not call it.
 #[derive(Debug)]
 pub struct WorkspaceStore {
     pub(super) conn: rusqlite::Connection,
@@ -73,8 +114,8 @@ pub struct WorkspaceStore {
 }
 
 impl WorkspaceStore {
-    /// The handle's current schema-gate state. A guarded write can transition
-    /// it to [`SchemaState::NewerReadOnly`] after a peer upgrades the store.
+    /// The handle's current schema-gate state.
+    /// A guarded write can transition it to [`SchemaState::NewerReadOnly`] after a peer upgrades the store.
     pub fn schema_state(&self) -> SchemaState {
         self.schema
     }
@@ -84,14 +125,9 @@ impl WorkspaceStore {
         &self.path
     }
 
-    /// One consistent view: grouping, members in primary-key order, and the
-    /// `data_version` observed by the same read transaction. Works in both
-    /// schema states.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::Busy`] when the busy budget elapses,
-    /// [`StoreError::Sqlite`] otherwise.
+    /// One consistent view: grouping, members in primary-key order, and the `data_version` observed by the same read transaction.
+    /// Works in both schema states.
+    /// [`StoreError::Busy`] when the busy budget elapses, [`StoreError::Sqlite`] otherwise.
     pub fn snapshot(&self) -> Result<WorkspaceSnapshot> {
         let started = Instant::now();
         self.snapshot_inner()
@@ -100,63 +136,14 @@ impl WorkspaceStore {
 
     fn snapshot_inner(&self) -> Result<WorkspaceSnapshot> {
         let tx = self.conn.unchecked_transaction()?;
-        let grouping: String =
-            tx.query_row("SELECT grouping FROM meta WHERE id = 0", [], |r| r.get(0))?;
-        let mut stmt = tx.prepare(
-            "SELECT session_id, kind, origin, cwd, title, model, last_turn_summary,
-                    is_worktree, last_change_unix_ms, pin_rank, order_rank
-             FROM members ORDER BY session_id, kind",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(Member {
-                session_id: SessionId::new(row.get::<_, String>(0)?).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?,
-                kind: MemberKind::from_stored(row.get(1)?),
-                origin: MemberOrigin::from_stored(row.get(2)?),
-                cwd: row.get(3)?,
-                title: row.get(4)?,
-                model: row.get(5)?,
-                last_turn_summary: row.get(6)?,
-                is_worktree: row.get(7)?,
-                last_change_unix_ms: row.get(8)?,
-                pin_rank: row.get(9)?,
-                order_rank: row.get(10)?,
-            })
-        })?;
-        let members = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
-        let data_version: i64 = tx.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+        let snapshot = read_snapshot(&tx)?;
         tx.commit()?;
-        Ok(WorkspaceSnapshot {
-            grouping: Grouping::from_stored(grouping),
-            members,
-            data_version,
-        })
+        Ok(snapshot)
     }
 
-    /// `PRAGMA data_version` on this store's connection (autocommit, never
-    /// inside a held transaction, so WAL snapshot pinning cannot freeze the
-    /// value). SQLite's contract:
-    ///
-    /// - The value changes between two reads on a connection iff another
-    ///   connection committed to the database in the interim.
-    /// - Commits made on the same connection do not change the value that
-    ///   connection observes — a process that both writes and polls through
-    ///   one handle sees only *foreign* changes, with no self-echo
-    ///   suppression needed.
-    /// - The value is only meaningful compared against a previous read on
-    ///   the same connection; after a reopen, re-seed the baseline from a
-    ///   fresh [`Self::snapshot`].
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::Busy`] when the busy budget elapses,
-    /// [`StoreError::Sqlite`] otherwise.
+    /// `PRAGMA data_version` on this store's connection, in autocommit and never inside a held transaction, so WAL snapshot pinning cannot freeze it.
+    /// The value changes between two reads on a connection exactly when another connection committed to the database in the interim; Commits made on the same connection do not change the value that connection observes. A process that both writes and polls through one handle sees only *foreign* changes and never has to filter out its own; The value is only meaningful compared against a previous read on the same connection. After a reopen, re-seed the baseline from a fresh [`Self::snapshot`].
+    /// [`StoreError::Busy`] when the busy budget elapses, [`StoreError::Sqlite`] otherwise.
     pub fn data_version(&self) -> Result<i64> {
         let started = Instant::now();
         self.conn
@@ -165,18 +152,8 @@ impl WorkspaceStore {
             .map_err(|e| classify_busy(e, "data_version", started))
     }
 
-    /// Insert a member, or update the metadata columns of an existing one
-    /// (never its `origin` or ranks). At capacity, the least-recently-changed
-    /// unpinned members are evicted inside the same transaction.
-    ///
-    /// # Errors
-    ///
+    /// Insert a member, or update the metadata columns of an existing one (never its `origin` or ranks).
     /// [`StoreError::NewerSchema`] on a read-only handle,
-    /// [`StoreError::CwdRequired`] / [`StoreError::CwdNotAbsolute`] /
-    /// [`StoreError::CwdTooLong`] from validation, [`StoreError::AllPinned`]
-    /// when the workspace is full and
-    /// every member is pinned (nothing is written), [`StoreError::Busy`] /
-    /// [`StoreError::Sqlite`] from the database.
     pub fn insert_member(&mut self, member: NewMember) -> Result<InsertOutcome> {
         let NewMember {
             key,
@@ -270,9 +247,8 @@ impl WorkspaceStore {
             return Ok(InsertOutcome::UpdatedExisting);
         };
 
-        // Eviction is silent in the UI by product decision, so these lines
-        // are the only trace of the data removal — emitted only after the
-        // commit, so a rollback cannot leave a false destruction record.
+        // Eviction is silent in the UI by product decision, so these log lines are the only trace of the data removal
+        // They are emitted only after the commit, so a rollback cannot leave a false destruction record
         let eviction_ran = !victims.is_empty();
         let mut evicted = Vec::with_capacity(victims.len());
         for victim in victims {
@@ -288,9 +264,8 @@ impl WorkspaceStore {
             evicted.push(MemberKey { session_id, kind });
         }
         if remaining_overage > 0 {
-            // Refusing here would block a user action to make up for a
-            // past bug; pinned exemption is never weakened, so the
-            // overage drains as members are unpinned or removed.
+            // Refusing here would block a user action to make up for a past bug
+            // Pinned members stay exempt, so the overage drains as members are unpinned or removed
             tracing::warn!(
                 capacity = WORKSPACE_CAPACITY,
                 count = previous_count,
@@ -305,17 +280,9 @@ impl WorkspaceStore {
         })
     }
 
-    /// Update the metadata columns of an existing member. Cannot touch
-    /// `origin` or the rank columns: the parameter type does not carry them.
-    ///
-    /// # Errors
-    ///
+    /// Update the metadata columns of an existing member.
+    /// Cannot touch `origin` or the rank columns: the parameter type does not carry them.
     /// [`StoreError::NewerSchema`] on a read-only handle,
-    /// [`StoreError::CwdRequired`] / [`StoreError::CwdNotAbsolute`] /
-    /// [`StoreError::CwdTooLong`] from validation,
-    /// [`StoreError::MemberNotFound`] when the row does not
-    /// exist, [`StoreError::Busy`] / [`StoreError::Sqlite`] from the
-    /// database.
     pub fn update_member_metadata(
         &mut self,
         key: &MemberKey,
@@ -354,14 +321,9 @@ impl WorkspaceStore {
         Ok(())
     }
 
-    /// Remove a member. Idempotent: an already-removed member returns
-    /// [`RemoveOutcome::NotPresent`], never an error, so two windows racing
-    /// the same archive both succeed.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::NewerSchema`] on a read-only handle,
-    /// [`StoreError::Busy`] / [`StoreError::Sqlite`] from the database.
+    /// Remove a member.
+    /// Idempotent: an already-removed member returns [`RemoveOutcome::NotPresent`], never an error.
+    /// [`StoreError::NewerSchema`] on a read-only handle, [`StoreError::Busy`] / [`StoreError::Sqlite`] from the database.
     pub fn remove_member(&mut self, key: &MemberKey) -> Result<RemoveOutcome> {
         let started = Instant::now();
         let changed = self
@@ -386,26 +348,93 @@ impl WorkspaceStore {
         Ok(outcome)
     }
 
-    /// Write `pin_rank` for every assignment in one all-or-nothing
-    /// transaction; a batch is the shape because renumbering a partition
-    /// whose rank gap ran out must be atomic. A pin toggle passes one
-    /// element.
-    ///
-    /// # Errors
-    ///
+    /// Applies all layout fields atomically; rejection includes a fresh post-rollback snapshot when available.
+    pub fn apply_layout_patch(&mut self, patch: &LayoutPatch) -> LayoutApplyOutcome {
+        let patch = match normalized_layout_patch(patch) {
+            Ok(patch) => patch,
+            Err(error) => return LayoutApplyOutcome::Failed { error },
+        };
+
+        let started = Instant::now();
+        let result = self.with_write_attempt("apply_layout_patch", |tx| {
+            let mut pin_stmt = tx.prepare(
+                "UPDATE members SET pin_rank = ?1
+                 WHERE session_id = ?2 AND kind = ?3",
+            )?;
+            for assignment in &patch.pin_assignments {
+                let rank = assignment.pinned.then_some(RANK_GAP);
+                let changed = pin_stmt.execute(params![
+                    rank,
+                    assignment.key.session_id.as_ref(),
+                    assignment.key.kind.as_str(),
+                ])?;
+                if changed == 0 {
+                    return Err(member_not_found(&assignment.key));
+                }
+            }
+            drop(pin_stmt);
+
+            if let Some(manual_order) = &patch.manual_order {
+                tx.execute(
+                    "UPDATE members SET order_rank = NULL WHERE kind = ?1",
+                    params![MemberKind::Build.as_str()],
+                )?;
+                let mut order_stmt = tx.prepare(
+                    "UPDATE members SET order_rank = ?1
+                     WHERE session_id = ?2 AND kind = ?3",
+                )?;
+                for (index, key) in manual_order.iter().enumerate() {
+                    let rank = i64::try_from(index + 1)
+                        .ok()
+                        .and_then(|value| value.checked_mul(RANK_GAP))
+                        .ok_or(StoreError::InvalidLayoutPatch {
+                            reason: "manual order rank overflow",
+                        })?;
+                    let changed = order_stmt.execute(params![
+                        rank,
+                        key.session_id.as_ref(),
+                        key.kind.as_str(),
+                    ])?;
+                    if changed == 0 {
+                        return Err(member_not_found(key));
+                    }
+                }
+            }
+
+            if let Some(grouping) = &patch.grouping {
+                tx.execute(
+                    "UPDATE meta SET grouping = ?1 WHERE id = 0",
+                    params![grouping.as_ref()],
+                )?;
+            }
+            read_snapshot(tx)
+        });
+
+        match result {
+            WriteAttempt::Committed(snapshot) => LayoutApplyOutcome::Committed(snapshot),
+            WriteAttempt::RolledBack(error) => {
+                let error = classify_layout_error(error, started);
+                match self.snapshot() {
+                    Ok(snapshot) => LayoutApplyOutcome::Rejected { error, snapshot },
+                    Err(error) => LayoutApplyOutcome::Failed {
+                        error: classify_layout_snapshot_error(error),
+                    },
+                }
+            }
+            WriteAttempt::Failed(error) => LayoutApplyOutcome::Failed {
+                error: classify_layout_error(error, started),
+            },
+        }
+    }
+
+    /// Write `pin_rank` for every assignment in one all-or-nothing transaction.
+    /// The API takes a batch because renumbering a partition whose rank gap ran out must be atomic; a pin toggle passes one element.
     /// [`StoreError::NewerSchema`] on a read-only handle,
-    /// [`StoreError::MemberNotFound`] when any assignment matches no row
-    /// (the whole batch rolls back), [`StoreError::Busy`] /
-    /// [`StoreError::Sqlite`] from the database.
     pub fn set_pin_rank(&mut self, assignments: &[RankAssignment]) -> Result<()> {
         self.set_ranks(RankColumn::Pin, assignments)
     }
 
-    /// Write `order_rank` for every assignment; same contract as
-    /// [`Self::set_pin_rank`].
-    ///
-    /// # Errors
-    ///
+    /// Write `order_rank` for every assignment; same contract as [`Self::set_pin_rank`].
     /// Same as [`Self::set_pin_rank`].
     pub fn set_order_rank(&mut self, assignments: &[RankAssignment]) -> Result<()> {
         self.set_ranks(RankColumn::Order, assignments)
@@ -445,15 +474,11 @@ impl WorkspaceStore {
     }
 
     /// Persist the workspace-wide grouping preference.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::NewerSchema`] on a read-only handle,
-    /// [`StoreError::Busy`] / [`StoreError::Sqlite`] from the database.
+    /// [`StoreError::NewerSchema`] on a read-only handle, [`StoreError::Busy`] / [`StoreError::Sqlite`] from the database.
     pub fn set_grouping(&mut self, grouping: &Grouping) -> Result<()> {
         let started = Instant::now();
         self.with_write("set_grouping", |tx| {
-            // The row is guaranteed by the schema-init seed.
+            // Schema init seeds the meta row, so the UPDATE always matches row 0
             tx.execute(
                 "UPDATE meta SET grouping = ?1 WHERE id = 0",
                 params![grouping.as_str()],
@@ -465,18 +490,9 @@ impl WorkspaceStore {
         Ok(())
     }
 
-    /// Move a member to a new session id in one transaction, ranks
-    /// included. When a row with the target key already exists, the two
-    /// merge deterministically: the target keeps its `origin` and metadata
-    /// (it is the live truth), its NULL ranks are filled from the old row,
-    /// and the old row is deleted.
-    ///
-    /// # Errors
-    ///
+    /// Move a member to a new session id in one transaction, ranks included.
+    /// When a row with the target key already exists, the two merge deterministically: the target keeps its `origin` and metadata as the live truth.
     /// [`StoreError::NewerSchema`] on a read-only handle,
-    /// [`StoreError::MemberNotFound`] when `old` does not exist (nothing is
-    /// changed), [`StoreError::Busy`] / [`StoreError::Sqlite`] from the
-    /// database.
     pub fn rekey(&mut self, old: &MemberKey, new_session_id: SessionId) -> Result<RekeyOutcome> {
         let started = Instant::now();
         let outcome = self
@@ -504,8 +520,7 @@ impl WorkspaceStore {
             let Some((old_pin, old_order)) = old_ranks else {
                 return Err(member_not_found(old));
             };
-            // Short-circuit before the merge arm: there the "target" would be
-            // the old row itself and the final delete would destroy it.
+            // Short-circuit before the merge arm: there the "target" would be the old row itself and the final delete would destroy it
             if old.session_id == *new_session_id {
                 return Ok(RekeyOutcome::NoChange);
             }
@@ -551,32 +566,72 @@ impl WorkspaceStore {
         op: &'static str,
         write: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.check_writable(op)?;
-        let tx = self
+        match self.with_write_attempt(op, write) {
+            WriteAttempt::Committed(value) => Ok(value),
+            WriteAttempt::RolledBack(error) | WriteAttempt::Failed(error) => Err(error),
+        }
+    }
+
+    fn with_write_attempt<T>(
+        &mut self,
+        op: &'static str,
+        write: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> WriteAttempt<T> {
+        if let Err(error) = self.check_writable(op) {
+            return WriteAttempt::Failed(error);
+        }
+        let tx = match self
             .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let found = read_user_version(&tx)?;
-        if found <= USER_VERSION {
-            let outcome = write(&tx)?;
-            tx.commit()?;
-            return Ok(outcome);
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+        {
+            Ok(tx) => tx,
+            Err(error) => return WriteAttempt::Failed(error.into()),
+        };
+        let found = match read_user_version(&tx) {
+            Ok(found) => found,
+            Err(error) => {
+                return match tx.rollback() {
+                    Ok(()) => WriteAttempt::RolledBack(error),
+                    Err(rollback_error) => WriteAttempt::Failed(rollback_error.into()),
+                };
+            }
+        };
+        if found > USER_VERSION {
+            if let Err(error) = tx.rollback() {
+                return WriteAttempt::Failed(error.into());
+            }
+            self.schema = SchemaState::NewerReadOnly {
+                user_version: found,
+            };
+            if let Err(error) = self.conn.pragma_update(None, "query_only", true) {
+                tracing::warn!(
+                    op,
+                    %error,
+                    "workspace store schema gate is read-only but SQLite query_only could not be set"
+                );
+            }
+            tracing::warn!(
+                op,
+                found,
+                supported = USER_VERSION,
+                "workspace store was upgraded by another process; switching to read-only"
+            );
+            return WriteAttempt::Failed(StoreError::NewerSchema {
+                found,
+                supported: USER_VERSION,
+            });
         }
 
-        tx.rollback()?;
-        self.conn.pragma_update(None, "query_only", true)?;
-        self.schema = SchemaState::NewerReadOnly {
-            user_version: found,
-        };
-        tracing::warn!(
-            op,
-            found,
-            supported = USER_VERSION,
-            "workspace store was upgraded by another process; switching to read-only"
-        );
-        Err(StoreError::NewerSchema {
-            found,
-            supported: USER_VERSION,
-        })
+        match write(&tx) {
+            Ok(value) => match tx.commit() {
+                Ok(()) => WriteAttempt::Committed(value),
+                Err(error) => WriteAttempt::Failed(error.into()),
+            },
+            Err(error) => match tx.rollback() {
+                Ok(()) => WriteAttempt::RolledBack(error),
+                Err(rollback_error) => WriteAttempt::Failed(rollback_error.into()),
+            },
+        }
     }
 
     fn check_writable(&self, op: &'static str) -> Result<()> {
@@ -593,8 +648,68 @@ impl WorkspaceStore {
     }
 }
 
-/// The two gapped-rank partitions; both setters share one write shape
-/// because gap exhaustion (and its atomic renumber) applies to either.
+fn normalized_layout_patch(patch: &LayoutPatch) -> Result<LayoutPatch> {
+    let mut pin_values = HashMap::with_capacity(patch.pin_assignments.len());
+    for assignment in &patch.pin_assignments {
+        if assignment.key.kind != MemberKind::Build {
+            return Err(StoreError::InvalidLayoutPatch {
+                reason: "layout applies only to build members",
+            });
+        }
+        pin_values.insert(assignment.key.clone(), assignment.pinned);
+    }
+    let mut pin_assignments = pin_values
+        .into_iter()
+        .map(|(key, pinned)| PinAssignment { key, pinned })
+        .collect::<Vec<_>>();
+    pin_assignments.sort_by(|left, right| {
+        left.key
+            .session_id
+            .as_ref()
+            .cmp(right.key.session_id.as_ref())
+    });
+
+    let manual_order = if let Some(manual_order) = &patch.manual_order {
+        let mut order_keys = HashSet::with_capacity(manual_order.len());
+        let mut normalized = Vec::with_capacity(manual_order.len());
+        for key in manual_order {
+            if key.kind != MemberKind::Build {
+                return Err(StoreError::InvalidLayoutPatch {
+                    reason: "layout applies only to build members",
+                });
+            }
+            if order_keys.insert(key.clone()) {
+                normalized.push(key.clone());
+            }
+        }
+        Some(normalized)
+    } else {
+        None
+    };
+
+    Ok(LayoutPatch {
+        pin_assignments,
+        manual_order,
+        grouping: patch.grouping,
+    })
+}
+
+fn classify_layout_error(error: StoreError, started: Instant) -> StoreError {
+    let error = match error {
+        StoreError::Sqlite(error) => classify_unusable(error),
+        other => other,
+    };
+    classify_busy(error, "apply_layout_patch", started)
+}
+
+fn classify_layout_snapshot_error(error: StoreError) -> StoreError {
+    match error {
+        StoreError::Sqlite(error) => classify_unusable(error),
+        other => other,
+    }
+}
+
+/// The two gapped-rank columns; both setters share this code because gap exhaustion (and its atomic renumber) applies to either.
 #[derive(Clone, Copy)]
 enum RankColumn {
     Pin,

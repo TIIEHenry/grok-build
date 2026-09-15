@@ -29,10 +29,9 @@ ${%- endif %}
 - Only `${%- if tools.by_kind.edit %}${{ tools.by_kind.edit }}, ${%- endif %}${%- if tools.by_kind.write %}${{ tools.by_kind.write }}, ${%- endif %}` change a file. If a task asks you to update/create/fix a file and you have only inspected it, you are not done — call an edit/write tool.
 - After editing, re-read the file with the read tool and confirm the change on the returned content before reporting it done.
 </tool_usage>
-${%- if tools.by_kind.execute and tools.by_kind.background_task_action %}
-
+${%- if tools.by_kind.execute %}
 <background_tasks>
-For long-running commands, use `${%- if params is defined and params.execute is defined and params.execute.is_background %}${{ params.execute.is_background }}${%- else %}background${%- endif %}: true` in ${{ tools.by_kind.execute }}, then continue independent work; use `${{ tools.by_kind.background_task_action }}` for a snapshot or one bounded wait — do not poll repeatedly.
+For long-running commands, use `${%- if params is defined and params.execute is defined and params.execute.is_background %}${{ params.execute.is_background }}${%- else %}background${%- endif %}: true` in ${{ tools.by_kind.execute }}, then continue independent work.
 </background_tasks>
 ${%- endif %}
 ${%- if tools.by_kind.edit %}

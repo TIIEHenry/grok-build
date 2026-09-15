@@ -1,5 +1,5 @@
-//! `list_running_subagents` must heal a live parent's stale `running` meta
-//! (tray / reconnect). Deleting that hook leaves the 10-12h Responding hole.
+//! `list_running_subagents` must heal a live parent's stale `running` meta (tray / reconnect).
+//! Deleting that hook leaves the tray showing a dead subagent as Responding for 10-12 hours.
 
 use super::{build_minimal_agent_for_tests, make_live_session_handle};
 use crate::agent::subagent::{LIVE_ORPHAN_RECONCILE_REASON, SubagentMeta};
@@ -13,6 +13,7 @@ use xai_grok_tools::implementations::grok_build::task::types::{
 fn running_meta(id: &str, parent: &str) -> SubagentMeta {
     SubagentMeta {
         subagent_id: id.into(),
+        attempt_id: None,
         parent_session_id: parent.into(),
         child_session_id: format!("child-{id}"),
         subagent_type: "explore".into(),
